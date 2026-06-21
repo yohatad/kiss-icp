@@ -1,0 +1,21 @@
+kiss_icp_node:
+  ros__parameters:
+    # Frames — must match the Pepper TF tree
+    base_frame: "base_footprint"        # Pepper's root frame
+    lidar_odom_frame: "odom"            # standard REP-105 odom frame
+    publish_odom_tf: true               # KISS-ICP owns odom -> base_footprint
+    invert_odom_tf: false
+    position_covariance: 0.1
+    orientation_covariance: 0.1
+
+    data:
+      deskew: true        # uses per-point timestamps inside the L2 scan
+      max_range: 30.0     # indoor Pepper environment; L2 hardware max is 100 m
+      min_range: 0.5      # avoid self-hits from Pepper's body / arms
+
+    mapping:
+      max_points_per_voxel: 20
+
+    adaptive_threshold:
+      initial_threshold: 2.0
+      min_motion_th: 0.1    # increase to ~0.3 if odometry drifts while stationary
