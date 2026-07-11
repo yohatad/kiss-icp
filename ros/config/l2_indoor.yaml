@@ -1,0 +1,24 @@
+# KISS-ICP tuned for the Unitree L2 (/points) indoors on Pepper.
+# Defaults (max_range 100, voxel 1.0) are outdoor-scale and diverge on this
+# sensor; validated on bag slam_session_20260709_085909 (ATE ~0.24 m vs wheel
+# odometry). Launch with base_frame:=base_footprint so odometry comes out in
+# the robot frame instead of the tilted lidar frame.
+kiss_icp_node:
+  ros__parameters:
+    data:
+      deskew: True
+      max_range: 25.0
+      min_range: 0.7
+
+    mapping:
+      voxel_size: 0.3
+      max_points_per_voxel: 20
+
+    adaptive_threshold:
+      initial_threshold: 2.0
+      min_motion_th: 0.1
+
+    registration:
+      max_num_iterations: 500
+      convergence_criterion: 0.0001
+      max_num_threads: 0
