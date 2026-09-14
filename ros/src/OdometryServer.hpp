@@ -27,6 +27,10 @@
 
 // ROS 2
 #include <nav_msgs/msg/odometry.hpp>
+#include <deque>
+#include <mutex>
+#include <nav_msgs/msg/odometry.hpp>
+#include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/header.hpp>
@@ -52,6 +56,20 @@ private:
     /// Register new frame
     void RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
 
+    /// Buffer an external odometry sample (prior.source = wheel_odom).
+    void OdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg);
+
+    /// The sensor's motion between the previous and the current scan, from the
+    /// buffered odometry, in the sensor body frame -- what KissICP::delta()
+    /// holds. std::nullopt when the buffer cannot bracket both stamps within
+    /// prior.max_age, so the caller falls back to constant velocity.
+    std::optional<Sophus::SE3d> WheelPriorDelta(double prev_stamp,
+                                                double curr_stamp,
+                                                const std::string &cloud_frame_id);
+
+    /// Odometry pose interpolated at `stamp`, or nullopt if not bracketed.
+    std::optional<Sophus::SE3d> InterpolateOdometry(double stamp) const;
+
     /// Stream the estimated pose to ROS
     void PublishOdometry(const Sophus::SE3d &kiss_pose, const std_msgs::msg::Header &header);
 
@@ -73,6 +91,20 @@ private:
 
     /// Data subscribers.
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+
+    /// Motion prior. "constant_velocity" is stock KISS-ICP; "wheel_odom" takes
+    /// the delta between consecutive scans from an external odometry topic.
+    std::string prior_source_{"constant_velocity"};
+    std::string prior_odom_topic_{"/pepper_odom"};
+    double prior_max_age_{0.2};        // s; older/unbracketed samples -> fallback
+    bool prior_rotation_only_{false};  // wheel rotation, constant-velocity translation
+    std::deque<std::pair<double, Sophus::SE3d>> odom_buffer_;  // (stamp, odom<-child)
+    std::string odom_child_frame_;  // the odometry's body frame, from its messages
+    mutable std::mutex odom_mutex_;
+    std::optional<double> prev_scan_stamp_;
+    // Diagnostics: how often the wheel prior was actually used.
+    size_t prior_used_{0}, prior_fallback_{0};
 
     /// Data publishers.
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;

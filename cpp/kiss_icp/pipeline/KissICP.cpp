@@ -34,8 +34,18 @@ namespace kiss_icp::pipeline {
 
 KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
                                                     const std::vector<double> &timestamps) {
+    return RegisterFrame(frame, timestamps, std::nullopt);
+}
+
+KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
+                                                    const std::vector<double> &timestamps,
+                                                    const std::optional<Sophus::SE3d> &prior_delta) {
+    // Motion prediction: the external prior when one is supplied, otherwise the
+    // constant-velocity model (replay the previous frame's motion).
+    const Sophus::SE3d &predicted_delta = prior_delta.has_value() ? *prior_delta : last_delta_;
+
     // Preprocess the input cloud
-    const auto &preprocessed_frame = preprocessor_.Preprocess(frame, timestamps, last_delta_);
+    const auto &preprocessed_frame = preprocessor_.Preprocess(frame, timestamps, predicted_delta);
 
     // Voxelize
     const auto &[source, frame_downsample] = Voxelize(preprocessed_frame);
@@ -44,7 +54,7 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
     const double sigma = adaptive_threshold_.ComputeThreshold();
 
     // Compute initial_guess for ICP
-    const auto initial_guess = last_pose_ * last_delta_;
+    const auto initial_guess = last_pose_ * predicted_delta;
 
     // Run ICP
     const auto new_pose = registration_.AlignPointsToMap(source,         // frame

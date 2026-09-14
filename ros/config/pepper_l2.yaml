@@ -19,3 +19,12 @@ kiss_icp_node:
     adaptive_threshold:
       initial_threshold: 2.0
       min_motion_th: 0.1    # increase to ~0.3 if odometry drifts while stationary
+
+    # Motion prior for the ICP initial guess. "constant_velocity" is upstream
+    # KISS-ICP; "wheel_odom" uses Pepper's fused wheel+IMU odometry (/pepper_odom)
+    # and falls back to constant velocity when no odometry brackets the scan.
+    prior:
+      source: wheel_odom
+      odom_topic: /pepper_odom
+      max_age: 0.2          # s; oldest odometry accepted for interpolation
+      rotation_only: false  # true = take only rotation from odometry, translation from ICP

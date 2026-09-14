@@ -43,6 +43,7 @@
 #include <rclcpp/qos.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sophus/interpolate.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
@@ -86,6 +87,13 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         "pointcloud_topic", rclcpp::SensorDataQoS(),
         std::bind(&OdometryServer::RegisterFrame, this, std::placeholders::_1));
+    if (prior_source_ == "wheel_odom") {
+        // BEST_EFFORT matches a RELIABLE or a BEST_EFFORT publisher; depth 50
+        // rides out the odometry running several times the scan rate.
+        odometry_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            prior_odom_topic_, rclcpp::SensorDataQoS().keep_last(50),
+            std::bind(&OdometryServer::OdometryCallback, this, std::placeholders::_1));
+    }
 
     // Initialize publishers
     rclcpp::QoS qos((rclcpp::SystemDefaultsQoS().keep_last(1).durability_volatile()));
@@ -127,6 +135,23 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     orientation_covariance_ = declare_parameter<double>("orientation_covariance", 0.1);
     RCLCPP_INFO(this->get_logger(), "\tOrientation covariance: %.2f", orientation_covariance_);
 
+    prior_source_ = declare_parameter<std::string>("prior.source", prior_source_);
+    prior_odom_topic_ = declare_parameter<std::string>("prior.odom_topic", prior_odom_topic_);
+    prior_max_age_ = declare_parameter<double>("prior.max_age", prior_max_age_);
+    prior_rotation_only_ = declare_parameter<bool>("prior.rotation_only", prior_rotation_only_);
+    if (prior_source_ != "constant_velocity" && prior_source_ != "wheel_odom") {
+        RCLCPP_WARN(get_logger(),
+                    "[WARNING] prior.source '%s' is not one of constant_velocity | wheel_odom; "
+                    "using constant_velocity",
+                    prior_source_.c_str());
+        prior_source_ = "constant_velocity";
+    }
+    RCLCPP_INFO(this->get_logger(), "\tMotion prior: %s", prior_source_.c_str());
+    if (prior_source_ == "wheel_odom") {
+        RCLCPP_INFO(this->get_logger(), "\t  odom topic: %s  max_age: %.2f s  rotation_only: %d",
+                    prior_odom_topic_.c_str(), prior_max_age_, prior_rotation_only_);
+    }
+
     config.max_range = declare_parameter<double>("data.max_range", config.max_range);
     RCLCPP_INFO(this->get_logger(), "\tMax range: %.2f", config.max_range);
     config.min_range = declare_parameter<double>("data.min_range", config.min_range);
@@ -165,8 +190,27 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     const auto points = PointCloud2ToEigen(msg);
     const auto timestamps = GetTimestamps(msg);
 
+    // Motion prior for this frame: the wheel-odometry delta since the previous
+    // scan when configured and available, else nullopt (constant velocity).
+    const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+    std::optional<Sophus::SE3d> prior;
+    if (prior_source_ == "wheel_odom" && prev_scan_stamp_.has_value()) {
+        prior = WheelPriorDelta(*prev_scan_stamp_, stamp, cloud_frame_id);
+        if (prior.has_value()) {
+            ++prior_used_;
+        } else {
+            ++prior_fallback_;
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "wheel prior unavailable for this scan (odometry stale or not "
+                                 "bracketing %.3f..%.3f); using constant velocity. used=%zu "
+                                 "fallback=%zu",
+                                 *prev_scan_stamp_, stamp, prior_used_, prior_fallback_);
+        }
+    }
+    prev_scan_stamp_ = stamp;
+
     // Register frame, main entry point to KISS-ICP pipeline
-    const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps);
+    const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps, prior);
 
     // Extract the last KISS-ICP pose, ego-centric to the LiDAR
     const Sophus::SE3d kiss_pose = kiss_icp_->pose();
@@ -241,9 +285,88 @@ void OdometryServer::ResetService(
 
     // Reset the KISS-ICP pipeline
     kiss_icp_->Reset();
+    {
+        std::lock_guard<std::mutex> lock(odom_mutex_);
+        odom_buffer_.clear();
+    }
+    prev_scan_stamp_.reset();
+    prior_used_ = prior_fallback_ = 0;
 
     RCLCPP_INFO(this->get_logger(), "KISS-ICP reset completed successfully");
 }
+void OdometryServer::OdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg) {
+    const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+    const Sophus::SE3d pose = tf2::poseToSophus(msg->pose.pose);
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    odom_child_frame_ = msg->child_frame_id;
+    // Keep the buffer ordered and bounded: drop anything older than the window
+    // needed to bracket the previous scan plus max_age.
+    if (!odom_buffer_.empty() && stamp < odom_buffer_.back().first) return;  // out of order
+    odom_buffer_.emplace_back(stamp, pose);
+    const double keep_from = stamp - 2.0 * prior_max_age_ - 1.0;
+    while (odom_buffer_.size() > 2 && odom_buffer_.front().first < keep_from) {
+        odom_buffer_.pop_front();
+    }
+}
+
+std::optional<Sophus::SE3d> OdometryServer::InterpolateOdometry(double stamp) const {
+    // Caller holds odom_mutex_.
+    if (odom_buffer_.size() < 2) return std::nullopt;
+    // First sample at or after `stamp`.
+    auto hi = std::lower_bound(
+        odom_buffer_.begin(), odom_buffer_.end(), stamp,
+        [](const std::pair<double, Sophus::SE3d> &s, double t) { return s.first < t; });
+    if (hi == odom_buffer_.end()) {
+        // Query is past the newest sample: allow a short extrapolation-free hold
+        // only if the newest sample is fresh enough, else fail.
+        const auto &last = odom_buffer_.back();
+        return (stamp - last.first) <= prior_max_age_ ? std::optional(last.second) : std::nullopt;
+    }
+    if (hi == odom_buffer_.begin()) {
+        return (hi->first - stamp) <= prior_max_age_ ? std::optional(hi->second) : std::nullopt;
+    }
+    const auto lo = std::prev(hi);
+    const double span = hi->first - lo->first;
+    if (span > prior_max_age_) return std::nullopt;  // gap in the odometry stream
+    const double alpha = span > 0.0 ? (stamp - lo->first) / span : 0.0;
+    return Sophus::interpolate(lo->second, hi->second, alpha);
+}
+
+std::optional<Sophus::SE3d> OdometryServer::WheelPriorDelta(double prev_stamp,
+                                                            double curr_stamp,
+                                                            const std::string &cloud_frame_id) {
+    std::optional<Sophus::SE3d> p0, p1;
+    std::string child_frame;
+    {
+        std::lock_guard<std::mutex> lock(odom_mutex_);
+        p0 = InterpolateOdometry(prev_stamp);
+        p1 = InterpolateOdometry(curr_stamp);
+        child_frame = odom_child_frame_;
+    }
+    if (!p0.has_value() || !p1.has_value() || child_frame.empty()) return std::nullopt;
+
+    // Motion of the odometry's child frame (its body, e.g. base_footprint)
+    // between the two scans, in that body frame at prev_stamp:
+    //   odom<-body(t1) = odom<-body(t0) * D_B
+    const Sophus::SE3d delta_base = p0->inverse() * (*p1);
+
+    // Rotate it into the sensor frame. With X = body<-sensor (static extrinsic),
+    // odom<-sensor(t) = odom<-body(t) * X, so
+    //   odom<-sensor(t1) = odom<-sensor(t0) * X^-1 * D_B * X
+    // and X^-1 * D_B * X is the sensor-frame delta KissICP::delta() expects.
+    // The extrinsic is between the ODOMETRY's body frame and the sensor, which
+    // need not be base_frame_ (that only chooses the frame KISS reports in).
+    const Sophus::SE3d X = LookupTransform(child_frame, cloud_frame_id, tf2_buffer_);
+    Sophus::SE3d delta_sensor = X.inverse() * delta_base * X;
+
+    if (prior_rotation_only_) {
+        // Wheel yaw is usually trustworthy on this base; translation slips.
+        // Keep the wheel rotation and the constant-velocity translation.
+        delta_sensor.translation() = kiss_icp_->delta().translation();
+    }
+    return delta_sensor;
+}
+
 }  // namespace kiss_icp_ros
 
 #include "rclcpp_components/register_node_macro.hpp"

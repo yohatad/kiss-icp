@@ -73,6 +73,13 @@ inline geometry_msgs::msg::Pose sophusToPose(const Sophus::SE3d &T) {
     return t;
 }
 
+inline Sophus::SE3d poseToSophus(const geometry_msgs::msg::Pose &pose) {
+    const auto &q = pose.orientation;
+    const auto &p = pose.position;
+    return Sophus::SE3d(Sophus::SE3d::QuaternionType(q.w, q.x, q.y, q.z),
+                        Sophus::SE3d::Point(p.x, p.y, p.z));
+}
+
 inline Sophus::SE3d transformToSophus(const geometry_msgs::msg::TransformStamped &transform) {
     const auto &t = transform.transform;
     return Sophus::SE3d(

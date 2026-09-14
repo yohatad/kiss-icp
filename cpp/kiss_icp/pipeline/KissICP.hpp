@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <optional>
 #include <sophus/se3.hpp>
 #include <tuple>
 #include <vector>
@@ -70,6 +71,16 @@ public:
 public:
     Vector3dVectorTuple RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
                                       const std::vector<double> &timestamps);
+    /// Same, with an externally supplied motion prior: the sensor's motion since
+    /// the previous frame, expressed in the sensor body frame (the same quantity
+    /// delta() holds). It replaces the constant-velocity prediction for both
+    /// deskewing and the ICP initial guess. std::nullopt falls back to constant
+    /// velocity, so callers can drop the prior per frame when their source is
+    /// stale. The adaptive threshold still measures ICP's correction against
+    /// whatever prior it was given.
+    Vector3dVectorTuple RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
+                                      const std::vector<double> &timestamps,
+                                      const std::optional<Sophus::SE3d> &prior_delta);
     Vector3dVectorTuple Voxelize(const std::vector<Eigen::Vector3d> &frame) const;
 
     std::vector<Eigen::Vector3d> LocalMap() const { return local_map_.Pointcloud(); };
