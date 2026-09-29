@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <Eigen/Core>
+#include <cmath>
 #include <memory>
 #include <sophus/se3.hpp>
 #include <utility>
@@ -130,6 +131,9 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     RCLCPP_INFO(this->get_logger(), "\tInvert odometry transform: %d", invert_odom_tf_);
     publish_debug_clouds_ = declare_parameter<bool>("publish_debug_clouds", publish_debug_clouds_);
     RCLCPP_INFO(this->get_logger(), "\tPublish debug clouds: %d", publish_debug_clouds_);
+    floor_lock_enabled_ = declare_parameter<bool>("floor_lock", floor_lock_enabled_);
+    RCLCPP_INFO(this->get_logger(), "\tFloor lock (no IMU/ground constraint otherwise): %d",
+                floor_lock_enabled_);
     position_covariance_ = declare_parameter<double>("position_covariance", 0.1);
     RCLCPP_INFO(this->get_logger(), "\tPosition covariance: %.2f", position_covariance_);
     orientation_covariance_ = declare_parameter<double>("orientation_covariance", 0.1);
@@ -213,7 +217,26 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps, prior);
 
     // Extract the last KISS-ICP pose, ego-centric to the LiDAR
-    const Sophus::SE3d kiss_pose = kiss_icp_->pose();
+    Sophus::SE3d kiss_pose = kiss_icp_->pose();
+
+    // Floor lock (see LockToFloor's docstring for why). This frame's own map
+    // integration, just above, already ran with the untouched kiss_pose --
+    // one frame's worth of tilt baked into the map is the accepted trade-off
+    // for not fighting the ICP search itself. Locking kiss_icp_->pose() here
+    // means the NEXT frame's ICP initial guess and map integration both
+    // start level.
+    if (floor_lock_enabled_) {
+        const auto egocentric_estimation = (base_frame_.empty() || base_frame_ == cloud_frame_id);
+        const Sophus::SE3d cloud2base = egocentric_estimation
+                                             ? Sophus::SE3d()
+                                             : LookupTransform(base_frame_, cloud_frame_id, tf2_buffer_);
+        const Sophus::SE3d base_pose =
+            egocentric_estimation ? kiss_pose : cloud2base * kiss_pose * cloud2base.inverse();
+        const Sophus::SE3d base_pose_locked = LockToFloor(base_pose);
+        kiss_pose = egocentric_estimation ? base_pose_locked
+                                          : cloud2base.inverse() * base_pose_locked * cloud2base;
+        kiss_icp_->pose() = kiss_pose;
+    }
 
     // Spit the current estimated pose to ROS msgs handling the desired target frame
     PublishOdometry(kiss_pose, msg->header);
@@ -221,6 +244,14 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     if (publish_debug_clouds_) {
         PublishClouds(frame, keypoints, msg->header);
     }
+}
+
+Sophus::SE3d OdometryServer::LockToFloor(const Sophus::SE3d &base_pose) const {
+    const auto &R = base_pose.so3().matrix();
+    const double yaw = std::atan2(R(1, 0), R(0, 0));
+    Eigen::Vector3d flat_translation = base_pose.translation();
+    flat_translation.z() = 0.0;
+    return Sophus::SE3d(Sophus::SO3d::rotZ(yaw), flat_translation);
 }
 
 void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,

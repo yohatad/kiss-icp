@@ -56,6 +56,16 @@ private:
     /// Register new frame
     void RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
 
+    /// Project base_pose onto the floor: keep x/y and yaw, zero z/roll/pitch.
+    /// KISS-ICP has no IMU and no ground constraint, so point-to-point ICP
+    /// against largely planar indoor floor/walls free-drifts in z/roll/pitch
+    /// (measured: z swinging ~40cm and roll/pitch swinging +-14 deg within
+    /// ~15s of driving). Called every frame so both the published pose and
+    /// the pipeline's own internal state feed the next frame's ICP initial
+    /// guess and map integration from a level reference, instead of letting
+    /// the tilt compound frame after frame.
+    Sophus::SE3d LockToFloor(const Sophus::SE3d &base_pose) const;
+
     /// Buffer an external odometry sample (prior.source = wheel_odom).
     void OdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg);
 
@@ -88,6 +98,7 @@ private:
     bool invert_odom_tf_;
     bool publish_odom_tf_;
     bool publish_debug_clouds_;
+    bool floor_lock_enabled_{true};
 
     /// Data subscribers.
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
